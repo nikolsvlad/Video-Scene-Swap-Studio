@@ -1,14 +1,6 @@
-"""
-Пример CLI-запуска замены фона видео без GUI.
-
-Вся логика обращения к Hugging Face Space вынесена в executor.process_video,
-чтобы не дублировать код с гуи-приложением.
-"""
-
 import os
 from executor import process_video
 
-# --- Пути: всё что нужно менять - тут, в одном месте ---
 INPUT_DIR = "input"
 
 SOURCE_VIDEO = os.path.join(INPUT_DIR, "source_clip.mp4")
