@@ -1,16 +1,7 @@
-"""
-GUI-программа: замена фона видео + независимая панель QA-агента.
-
-Запуск для разработки:  python gui_app.py
-Превращение в .exe:      pyinstaller --onefile --windowed gui_app.py
-"""
-
 import os
 import re
-import io
 import json
 import shutil
-import contextlib
 import subprocess
 import datetime
 import threading
@@ -110,6 +101,7 @@ class App(tk.Tk):
         self.quality_mode = tk.StringVar(value="fast")
         self.no_timeout = tk.BooleanVar(value=False)
         self.auto_convert = tk.BooleanVar(value=False)
+        self.process_output_dir = tk.StringVar(value=OUTPUT_DIR)
         self.last_result_path = None
 
         # --- Переменные: панель QA-агента (независимая) ---
@@ -125,16 +117,19 @@ class App(tk.Tk):
         self.conv_custom_height = tk.StringVar(value="720")
         self.conv_audio_codec = tk.StringVar(value="aac")
         self.conv_crf = tk.IntVar(value=23)
-
-        # --- Переменные: панель ручных эндпоинтов (независимая) ---
-        self.manual_space_id = tk.StringVar(value="")
-        self.manual_token = tk.StringVar(value="")
-        self.manual_api_name = tk.StringVar(value="/predict")
+        self.conv_output_dir = tk.StringVar(value=OUTPUT_DIR)
 
         # --- Переменные: панель индексации футажей (независимая) ---
         self.index_folder_path = tk.StringVar()
         self.index_search_query = tk.StringVar()
         self.index_skip_existing = tk.BooleanVar(value=True)
+
+        # --- Переменные: панель слияния изображений (через FLUX.2, HF Inference Providers) ---
+        self.merge_image1_path = tk.StringVar()
+        self.merge_image2_path = tk.StringVar()
+        self.merge_prompt = tk.StringVar(value="")
+        self.merge_output_dir = tk.StringVar(value=OUTPUT_DIR)
+        self.merge_flux_provider = tk.StringVar(value="fal-ai")
 
         self.log_queue = queue.Queue()
 
@@ -142,13 +137,87 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._poll_log_queue()
 
+        # Ctrl+C/V/A/X по КОДУ физической клавиши, не по символу — работает
+        # в любой раскладке клавиатуры (русской, английской и т.д.), в отличие
+        # от встроенного механизма Tkinter, который смотрит на keysym и
+        # ломается при переключении раскладки. Действует на все текстовые
+        # поля программы сразу, привязка на уровне всего приложения.
+        self.bind_all("<Key>", self._global_ctrl_key_handler, add="+")
+
     def on_close(self):
         self.destroy()
         os._exit(0)
 
+    def _ui(self, fn):
+        """
+        Планирует выполнение fn в основном потоке Tkinter через .after(0, ...).
+        Tkinter НЕ потокобезопасен: обновлять виджеты (.config(...)) или
+        показывать messagebox напрямую из фонового threading.Thread — верный
+        способ поймать зависание или краш на случайном кадре. Все вызовы,
+        связанные с UI, из фоновых потоков (_run_*_in_background,
+        _process_in_background и т.п.) должны идти только через этот метод —
+        это выполняет их в основном потоке, где Tkinter ожидает работу.
+        """
+        self.after(0, fn)
+
     # ------------------------------------------------------------------
     # Общий каркас: заголовок + две колонки + лог снизу
     # ------------------------------------------------------------------
+
+    def _make_scrollable_tab(self, notebook):
+        """
+        Оборачивает содержимое вкладки в Canvas + вертикальный Scrollbar, чтобы
+        длинный контент (много полей на одной вкладке) можно было прокрутить
+        колёсиком мыши, а не упираться в обрезанное окно. Возвращает
+        (outer_frame_для_notebook, inner_frame_для_контента) — строить панель
+        нужно во ВТОРОМ значении, как раньше строили прямо во вкладке.
+        """
+        outer = ttk.Frame(notebook)
+
+        canvas = tk.Canvas(outer, bg=COLOR_PANEL, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=12)
+
+        inner_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        def _on_inner_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            # Растягиваем внутренний Frame по ширине канваса, чтобы поля
+            # не обрезались и не оставалось пустого места справа.
+            canvas.itemconfig(inner_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        # Прокрутка активна, только пока курсор реально над этой вкладкой —
+        # иначе колёсико мыши будет скроллить не ту вкладку, что видна.
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+
+        return outer, inner
 
     def _build_layout(self):
         header = tk.Frame(self, bg=COLOR_ACCENT, height=48)
@@ -172,23 +241,23 @@ class App(tk.Tk):
         notebook = ttk.Notebook(body)
         notebook.pack(fill="both", expand=True)
 
-        tab_process = ttk.Frame(notebook, padding=12)
-        tab_qa = ttk.Frame(notebook, padding=12)
-        tab_convert = ttk.Frame(notebook, padding=12)
-        tab_index = ttk.Frame(notebook, padding=12)
-        tab_manual = ttk.Frame(notebook, padding=12)
+        tab_process_outer, tab_process = self._make_scrollable_tab(notebook)
+        tab_qa_outer, tab_qa = self._make_scrollable_tab(notebook)
+        tab_convert_outer, tab_convert = self._make_scrollable_tab(notebook)
+        tab_index_outer, tab_index = self._make_scrollable_tab(notebook)
+        tab_merge_outer, tab_merge = self._make_scrollable_tab(notebook)
 
-        notebook.add(tab_process, text="Обработка видео")
-        notebook.add(tab_qa, text="QA-агент")
-        notebook.add(tab_convert, text="Конвертер (ffmpeg)")
-        notebook.add(tab_index, text="Банк футажей")
-        notebook.add(tab_manual, text="Ручные эндпоинты")
+        notebook.add(tab_process_outer, text="Обработка видео")
+        notebook.add(tab_qa_outer, text="QA-агент")
+        notebook.add(tab_convert_outer, text="Конвертер (ffmpeg)")
+        notebook.add(tab_index_outer, text="Банк футажей")
+        notebook.add(tab_merge_outer, text="Слияние изображений")
 
         self._build_processing_panel(tab_process)
         self._build_agent_panel(tab_qa)
         self._build_convert_panel(tab_convert)
         self._build_footage_index_panel(tab_index)
-        self._build_manual_endpoint_panel(tab_manual)
+        self._build_merge_panel(tab_merge)
 
         # --- Лог: отдельная панель с гарантированным минимумом высоты ---
         log_frame = tk.Frame(main_pane, bg=COLOR_BG)
@@ -207,6 +276,23 @@ class App(tk.Tk):
 
         main_pane.add(body, minsize=320, stretch="always")
         main_pane.add(log_frame, minsize=140, stretch="never")
+
+    def _build_output_dir_row(self, parent, var, label_text="Папка сохранения результата"):
+        """Добавляет строку 'папка сохранения + Обзор...' в любую панель. Возвращает Frame."""
+        ttk.Label(parent, text=label_text).pack(anchor="w", pady=(4, 0))
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(2, 8))
+        ttk.Entry(row, textvariable=var, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            row, text="Обзор...",
+            command=lambda: self._pick_output_dir(var)
+        ).pack(side="left", padx=(6, 0))
+        return row
+
+    def _pick_output_dir(self, var):
+        path = filedialog.askdirectory(title="Выбери папку для сохранения результата", initialdir=var.get() or OUTPUT_DIR)
+        if path:
+            var.set(path)
 
     # ------------------------------------------------------------------
     # Левая панель: обработка видео
@@ -280,6 +366,8 @@ class App(tk.Tk):
             font=("Segoe UI", 8), foreground="gray", justify="left"
         ).pack(anchor="w", pady=(0, 10))
 
+        self._build_output_dir_row(parent, self.process_output_dir)
+
         ttk.Button(
             parent, text="Обработать видео", command=self.run_processing
         ).pack(fill="x", pady=(4, 4))
@@ -350,12 +438,13 @@ class App(tk.Tk):
                 self.source_path.get(), self.bg_path.get(), self.bg_kind.get(),
                 fast_mode=(self.quality_mode.get() == "fast"),
                 no_timeout=self.no_timeout.get(),
+                output_dir=self.process_output_dir.get(),
                 log_callback=lambda m: self.log(f"[Обработка] {m}"),
             )
             self.log(f"[Обработка] Готово: {result_path}")
 
             if self.auto_convert.get():
-                self.status_label.config(text="Конвертирую (ffmpeg)...", fg="orange")
+                self._ui(lambda: self.status_label.config(text="Конвертирую (ffmpeg)...", fg="orange"))
                 self.log("[Обработка] Автоконвертация (ffmpeg)...")
                 try:
                     scale = self._resolve_conv_scale()
@@ -366,6 +455,7 @@ class App(tk.Tk):
                         scale=scale,
                         crf=self.conv_crf.get(),
                         audio_codec=self.conv_audio_codec.get(),
+                        output_dir=self.process_output_dir.get(),
                         log_callback=lambda m: self.log(f"[Обработка] [ffmpeg] {m}"),
                     )
                     self.log(f"[Обработка] Конвертация завершена: {result_path}")
@@ -375,18 +465,20 @@ class App(tk.Tk):
                     self.log(f"[Обработка] Конвертация не удалась, оставляю исходный файл: {e}")
 
             self.last_result_path = result_path
-            self.status_label.config(text=f"Готово:\n{result_path}", fg="green")
 
-            # Автоматически подставляем свежий (итоговый) результат в панель агента,
-            # но пользователь может выбрать любой другой файл вручную
-            self.qa_video_path.set(result_path)
-            self._refresh_agent_hint()
+            def _finish():
+                self.status_label.config(text=f"Готово:\n{result_path}", fg="green")
+                # Автоматически подставляем свежий (итоговый) результат в панель агента,
+                # но пользователь может выбрать любой другой файл вручную
+                self.qa_video_path.set(result_path)
+                self._refresh_agent_hint()
+                messagebox.showinfo("Готово", f"Результат сохранён:\n{result_path}")
 
-            messagebox.showinfo("Готово", f"Результат сохранён:\n{result_path}")
+            self._ui(_finish)
         except Exception as e:
             self.log(f"[Обработка] ОШИБКА: {e}")
-            self.status_label.config(text="Ошибка", fg="red")
-            messagebox.showerror("Ошибка", str(e))
+            self._ui(lambda: self.status_label.config(text="Ошибка", fg="red"))
+            self._ui(lambda: messagebox.showerror("Ошибка", str(e)))
 
     # ------------------------------------------------------------------
     # Правая панель: независимый QA-агент
@@ -519,17 +611,6 @@ class App(tk.Tk):
             verdict_text = "✅ ПРОШЛО ПРОВЕРКУ" if passed else "❌ НЕ ПРОШЛО ПРОВЕРКУ"
             verdict_color = "#2e7d32" if passed else "#c62828"
 
-            self.qa_verdict_label.config(text=verdict_text, fg=verdict_color)
-            self.qa_score_label.config(text=f"Оценка качества: {result['quality_score']}/10")
-            self.qa_flags_label.config(
-                text=(
-                    f"Персонаж узнаваем: {'да' if result['character_consistent'] else 'нет'}   |   "
-                    f"Сцена соответствует: {'да' if result['scene_matches'] else 'нет'}"
-                )
-            )
-            self.qa_issues_label.config(text=result["issues"] or "—")
-            self.qa_recommendation_label.config(text=result["recommendation"] or "—")
-
             self.qa_last_result_text = (
                 f"{verdict_text}\n"
                 f"Видео: {self.qa_video_path.get()}\n"
@@ -541,13 +622,27 @@ class App(tk.Tk):
                 f"Рекомендация для следующей попытки: {result['recommendation'] or '—'}"
             )
 
+            def _update():
+                self.qa_verdict_label.config(text=verdict_text, fg=verdict_color)
+                self.qa_score_label.config(text=f"Оценка качества: {result['quality_score']}/10")
+                self.qa_flags_label.config(
+                    text=(
+                        f"Персонаж узнаваем: {'да' if result['character_consistent'] else 'нет'}   |   "
+                        f"Сцена соответствует: {'да' if result['scene_matches'] else 'нет'}"
+                    )
+                )
+                self.qa_issues_label.config(text=result["issues"] or "—")
+                self.qa_recommendation_label.config(text=result["recommendation"] or "—")
+
+            self._ui(_update)
+
         except Exception as e:
             self.log(f"[Агент] ОШИБКА: {e}")
-            self.qa_verdict_label.config(text="⚠️ ОШИБКА ПРОВЕРКИ", fg="orange")
-            self.qa_issues_label.config(text=str(e))
             self.qa_last_result_text = f"ОШИБКА ПРОВЕРКИ\nВидео: {self.qa_video_path.get()}\n{e}"
+            self._ui(lambda: self.qa_verdict_label.config(text="⚠️ ОШИБКА ПРОВЕРКИ", fg="orange"))
+            self._ui(lambda: self.qa_issues_label.config(text=str(e)))
         finally:
-            self.qa_button.config(state="normal")
+            self._ui(lambda: self.qa_button.config(state="normal"))
 
     def copy_qa_result(self):
         if not self.qa_last_result_text:
@@ -638,6 +733,8 @@ class App(tk.Tk):
         )
         self.audio_combo.pack(anchor="w", pady=(2, 0))
 
+        self._build_output_dir_row(parent, self.conv_output_dir)
+
         ttk.Button(
             parent, text="Конвертировать", command=self.run_conversion
         ).pack(fill="x", pady=(4, 4))
@@ -721,15 +818,16 @@ class App(tk.Tk):
                 scale=scale,
                 crf=self.conv_crf.get(),
                 audio_codec=self.conv_audio_codec.get(),
+                output_dir=self.conv_output_dir.get(),
                 log_callback=lambda m: self.log(f"[Конвертер] {m}"),
             )
             self.log(f"[Конвертер] Готово: {result_path}")
-            self.conv_status_label.config(text=f"Готово:\n{result_path}", fg="green")
-            messagebox.showinfo("Готово", f"Результат сохранён:\n{result_path}")
+            self._ui(lambda: self.conv_status_label.config(text=f"Готово:\n{result_path}", fg="green"))
+            self._ui(lambda: messagebox.showinfo("Готово", f"Результат сохранён:\n{result_path}"))
         except Exception as e:
             self.log(f"[Конвертер] ОШИБКА: {e}")
-            self.conv_status_label.config(text="Ошибка", fg="red")
-            messagebox.showerror("Ошибка", str(e))
+            self._ui(lambda: self.conv_status_label.config(text="Ошибка", fg="red"))
+            self._ui(lambda: messagebox.showerror("Ошибка", str(e)))
 
     # ------------------------------------------------------------------
     # Панель индексации банка футажей (независимая, эмбеддинги Gemini)
@@ -816,17 +914,17 @@ class App(tk.Tk):
                 log_callback=lambda m: self.log(f"[Индексация] {m}"),
                 skip_existing=self.index_skip_existing.get(),
             )
-            self.index_status_label.config(
+            self._ui(lambda: self.index_status_label.config(
                 text=f"Готово. Новых/обновлённых файлов: {added}. Метаданные: {metadata_dir}",
                 fg="green",
-            )
+            ))
             self.log(f"[Индексация] Готово, новых/обновлённых записей: {added}")
         except Exception as e:
             self.log(f"[Индексация] ОШИБКА: {e}")
-            self.index_status_label.config(text="Ошибка индексации", fg="red")
-            messagebox.showerror("Ошибка", str(e))
+            self._ui(lambda: self.index_status_label.config(text="Ошибка индексации", fg="red"))
+            self._ui(lambda: messagebox.showerror("Ошибка", str(e)))
         finally:
-            self.index_button.config(state="normal")
+            self._ui(lambda: self.index_button.config(state="normal"))
 
     def run_index_search(self):
         query = self.index_search_query.get().strip()
@@ -851,7 +949,7 @@ class App(tk.Tk):
                 log_callback=lambda m: self.log(f"[Индексация] {m}"),
             )
             if not results:
-                self._set_readonly_text(self.index_results_text, "Ничего не найдено.")
+                self._ui(lambda: self._set_readonly_text(self.index_results_text, "Ничего не найдено."))
                 return
 
             lines = []
@@ -861,11 +959,12 @@ class App(tk.Tk):
                     f"   Путь: {r['path']}\n"
                     f"   Описание: {r['description']}\n"
                 )
-            self._set_readonly_text(self.index_results_text, "\n".join(lines))
+            result_text = "\n".join(lines)
+            self._ui(lambda: self._set_readonly_text(self.index_results_text, result_text))
             self.log(f"[Индексация] Найдено результатов: {len(results)}")
         except Exception as e:
             self.log(f"[Индексация] ОШИБКА поиска: {e}")
-            self._set_readonly_text(self.index_results_text, f"Ошибка: {e}")
+            self._ui(lambda: self._set_readonly_text(self.index_results_text, f"Ошибка: {e}"))
 
     def copy_index_results(self):
         text = self.index_results_text.get("1.0", tk.END).strip()
@@ -877,235 +976,233 @@ class App(tk.Tk):
         self.log("(результаты поиска футажей скопированы в буфер обмена)")
 
     # ------------------------------------------------------------------
-    # Панель ручных эндпоинтов Hugging Face (произвольная модель)
+    # Панель "Слияние изображений" — пресет ОДНОГО конкретного эндпоинта
+    # (в отличие от "Ручных эндпоинтов", которые универсальны под любой Space)
     # ------------------------------------------------------------------
 
-    def _build_manual_endpoint_panel(self, parent):
+    def _build_merge_panel(self, parent):
         ttk.Label(
             parent,
-            text="Позволяет дёрнуть ЛЮБОЙ Space на Hugging Face вручную —\n"
-                 "не только тот, что зашит в 'Обработка видео'. Полезно для\n"
-                 "тестирования новых моделей до того, как встраивать их в пайплайн.",
-            justify="left"
+            text="Слияние двух изображений через FLUX.2 (black-forest-labs/FLUX.2-dev), "
+                 "официальные Inference Providers HuggingFace (fal / Replicate / Together / "
+                 "WaveSpeed). Платно через кредиты провайдера, но надёжнее произвольных "
+                 "community Space — те слишком часто падают с RUNTIME_ERROR.",
+            justify="left", wraplength=800
         ).pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(parent, text="1. Space ID (например: author/space-name)").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.manual_space_id).pack(fill="x", pady=(2, 8))
+        provider_row = ttk.Frame(parent)
+        provider_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(provider_row, text="Провайдер:").pack(side="left")
+        ttk.Combobox(
+            provider_row, textvariable=self.merge_flux_provider, state="readonly", width=15,
+            values=["fal-ai", "replicate", "together", "wavespeed"]
+        ).pack(side="left", padx=(6, 0))
 
-        row_token = ttk.Frame(parent)
-        row_token.pack(fill="x", pady=(0, 8))
-        token_col = ttk.Frame(row_token)
-        token_col.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(token_col, text="2. Токен (пусто = взять HF_TOKEN из .env)").pack(anchor="w")
-        ttk.Entry(token_col, textvariable=self.manual_token, show="*").pack(fill="x", pady=(2, 0))
-
-        api_col = ttk.Frame(row_token)
-        api_col.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        ttk.Label(api_col, text="3. api_name эндпоинта").pack(anchor="w")
-        ttk.Entry(api_col, textvariable=self.manual_api_name).pack(fill="x", pady=(2, 0))
-
-        ttk.Button(
-            parent, text="Показать API этого Space", command=self.run_show_api
-        ).pack(fill="x", pady=(0, 8))
-
-        ttk.Label(
-            parent,
-            text="Список эндпоинтов и их параметров появится в окне ниже.\n"
-                 "Используй имена параметров как ключи в JSON справа.",
-            font=("Segoe UI", 8), foreground="gray", justify="left"
-        ).pack(anchor="w", pady=(0, 4))
-
-        split = ttk.Frame(parent)
-        split.pack(fill="both", expand=True, pady=(4, 8))
-
-        api_frame = ttk.Frame(split)
-        api_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        ttk.Label(api_frame, text="Описание API (только чтение)").pack(anchor="w")
-        self.manual_api_info = scrolledtext.ScrolledText(
-            api_frame, height=8, font=FONT_MONO, wrap="word"
+        ttk.Label(parent, text="1. Первое изображение").pack(anchor="w")
+        row1 = ttk.Frame(parent)
+        row1.pack(fill="x", pady=(2, 8))
+        ttk.Entry(row1, textvariable=self.merge_image1_path, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(row1, text="Обзор...", command=lambda: self.pick_merge_image(self.merge_image1_path)).pack(
+            side="left", padx=(6, 0)
         )
-        self.manual_api_info.pack(fill="both", expand=True, pady=(2, 0))
-        self._make_selectable_readonly(self.manual_api_info)
-        ttk.Button(
-            api_frame, text="Копировать описание API", command=self.copy_manual_api_info
-        ).pack(fill="x", pady=(4, 0))
 
-        params_frame = ttk.Frame(split)
-        params_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
-        ttk.Label(params_frame, text="4. Параметры вызова (JSON)").pack(anchor="w")
-        self.manual_params_text = tk.Text(params_frame, height=8, font=FONT_MONO, wrap="word")
-        self.manual_params_text.pack(fill="both", expand=True, pady=(2, 0))
-        self.manual_params_text.insert(
-            "1.0",
-            '{\n'
-            '  "some_param": "значение",\n'
-            '  "video_input": "C:/путь/к/файлу.mp4"\n'
-            '}\n'
+        ttk.Label(parent, text="2. Второе изображение").pack(anchor="w")
+        row2 = ttk.Frame(parent)
+        row2.pack(fill="x", pady=(2, 8))
+        ttk.Entry(row2, textvariable=self.merge_image2_path, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(row2, text="Обзор...", command=lambda: self.pick_merge_image(self.merge_image2_path)).pack(
+            side="left", padx=(6, 0)
         )
-        ttk.Label(
-            params_frame,
-            text="Строки с существующими путями к файлам автоматически\n"
-                 "оборачиваются в handle_file() — не нужно делать это вручную.",
-            font=("Segoe UI", 8), foreground="gray", justify="left"
-        ).pack(anchor="w", pady=(4, 0))
 
-        ttk.Button(
-            parent, text="Выполнить", command=self.run_manual_call
-        ).pack(fill="x", pady=(4, 4))
+        ttk.Label(parent, text="3. Текстовый промпт (что должно получиться в результате)").pack(anchor="w", pady=(4, 0))
+        ttk.Entry(parent, textvariable=self.merge_prompt).pack(fill="x", pady=(2, 10))
 
-        self.manual_status_label = tk.Label(
+        self._build_output_dir_row(parent, self.merge_output_dir, "Папка сохранения результата")
+
+        self.merge_button = ttk.Button(
+            parent, text="Слить изображения", command=self.run_merge_images
+        )
+        self.merge_button.pack(fill="x", pady=(4, 4))
+
+        self.merge_status_label = tk.Label(
             parent, text="Готов к работе", fg="gray", bg=COLOR_PANEL, font=FONT_NORMAL,
             anchor="w", justify="left", wraplength=800
         )
-        self.manual_status_label.pack(fill="x", pady=(4, 4))
+        self.merge_status_label.pack(fill="x", pady=(4, 0))
 
-        ttk.Label(parent, text="Результат вызова").pack(anchor="w")
-        self.manual_result_text = scrolledtext.ScrolledText(
-            parent, height=5, font=FONT_MONO, wrap="word"
+    def pick_merge_image(self, var):
+        path = filedialog.askopenfilename(
+            title="Выбери изображение",
+            filetypes=[("Картинки", "*.jpg *.jpeg *.png *.webp *.bmp")]
         )
-        self.manual_result_text.pack(fill="both", expand=False, pady=(2, 0))
-        self._make_selectable_readonly(self.manual_result_text)
-        ttk.Button(
-            parent, text="Копировать результат вызова", command=self.copy_manual_result
-        ).pack(fill="x", pady=(6, 0))
+        if path:
+            var.set(path)
 
-    def copy_manual_api_info(self):
-        text = self.manual_api_info.get("1.0", tk.END).strip()
-        if not text:
-            messagebox.showinfo("Нечего копировать", "Сначала загрузи описание API")
-            return
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.log("(описание API скопировано в буфер обмена)")
-
-    def copy_manual_result(self):
-        text = self.manual_result_text.get("1.0", tk.END).strip()
-        if not text:
-            messagebox.showinfo("Нечего копировать", "Сначала выполни вызов эндпоинта")
-            return
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.log("(результат вызова скопирован в буфер обмена)")
-
-    def _get_manual_token(self):
-        return self.manual_token.get().strip() or TOKEN
-
-    def run_show_api(self):
-        space_id = self.manual_space_id.get().strip()
-        if not space_id:
-            messagebox.showwarning("Внимание", "Укажи Space ID")
+    def run_merge_images(self):
+        if not self.merge_image1_path.get() or not self.merge_image2_path.get():
+            messagebox.showwarning("Внимание", "Выбери оба изображения")
             return
 
-        self.manual_status_label.config(text="Загружаю описание API...", fg="orange")
-        thread = threading.Thread(target=self._show_api_in_background, args=(space_id,), daemon=True)
+        self.merge_button.config(state="disabled")
+        self.merge_status_label.config(text="Отправляю запрос в FLUX.2...", fg="orange")
+        self.log("[Слияние] Отправляю изображения на слияние через FLUX.2 (HF Inference Providers)...")
+        thread = threading.Thread(target=self._run_merge_flux_in_background, daemon=True)
         thread.start()
 
-    def _show_api_in_background(self, space_id):
+    def _image_to_data_url(self, path):
+        """
+        Кодирует локальный файл изображения в data-URL (data:mime;base64,...) —
+        именно так huggingface_hub кодирует изображения внутри себя (проверено
+        по исходникам библиотеки: huggingface_hub/inference/_common.py, функция
+        _as_url). Нужно, чтобы передать ВТОРОЕ изображение вручную через kwargs,
+        так как официальный метод image_to_image() в установленной версии
+        библиотеки принимает только один `image` в сигнатуре — второе мы
+        подсовываем через параметр image_urls, который провайдер fal использует
+        у себя в payload (см. huggingface_hub/inference/_providers/fal_ai.py).
+        """
+        import base64
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(path)
+        mime_type = mime_type or "image/jpeg"
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode()
+        return f"data:{mime_type};base64,{encoded}"
+
+    def _run_merge_flux_in_background(self):
         try:
-            client = Client(space_id, token=self._get_manual_token())
-
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                client.view_api(print_info=True)
-            info_text = buf.getvalue() or "(пусто — Space не вернул описание API)"
-
-            self._set_readonly_text(self.manual_api_info, info_text)
-            self.manual_status_label.config(text="Описание API загружено", fg="green")
-            self.log(f"[Ручной эндпоинт] Показал API для {space_id}")
-        except Exception as e:
-            self.log(f"[Ручной эндпоинт] ОШИБКА при загрузке API: {e}")
-            self.manual_status_label.config(text="Ошибка загрузки API", fg="red")
-            self._set_readonly_text(self.manual_api_info, f"Ошибка: {e}")
-
-    def run_manual_call(self):
-        space_id = self.manual_space_id.get().strip()
-        if not space_id:
-            messagebox.showwarning("Внимание", "Укажи Space ID")
+            from huggingface_hub import InferenceClient
+        except ImportError:
+            self.log("[Слияние] ОШИБКА: не установлен пакет huggingface_hub")
+            self._ui(lambda: messagebox.showerror(
+                "Нужна библиотека",
+                "Установи: pip install huggingface_hub"
+            ))
+            self._ui(lambda: self.merge_button.config(state="normal"))
             return
 
-        raw_params = self.manual_params_text.get("1.0", tk.END).strip()
         try:
-            params = json.loads(raw_params) if raw_params else {}
-        except json.JSONDecodeError as e:
-            messagebox.showerror("Ошибка JSON", f"Не удалось разобрать параметры: {e}")
-            return
+            provider = self.merge_flux_provider.get()
+            client = InferenceClient(provider=provider, api_key=TOKEN)
 
-        api_name = self.manual_api_name.get().strip() or None
+            url1 = self._image_to_data_url(self.merge_image1_path.get())
+            url2 = self._image_to_data_url(self.merge_image2_path.get())
 
-        self.manual_status_label.config(text="Выполняю запрос...", fg="orange")
-        self._set_readonly_text(self.manual_result_text, "")
-        thread = threading.Thread(
-            target=self._run_manual_call_in_background,
-            args=(space_id, api_name, params),
-            daemon=True,
-        )
-        thread.start()
+            prompt = self.merge_prompt.get().strip() or (
+                "Seamlessly combine these two images into one coherent, unified image."
+            )
 
-    def _wrap_local_files(self, value):
-        """Рекурсивно оборачивает строки-пути к существующим файлам в handle_file()."""
-        if isinstance(value, str):
-            if os.path.isfile(value):
-                return handle_file(value)
-            return value
-        if isinstance(value, dict):
-            return {k: self._wrap_local_files(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [self._wrap_local_files(v) for v in value]
-        return value
+            self.log(f"[Слияние] Вызываю black-forest-labs/FLUX.2-dev через провайдера {provider}...")
+            # image_urls передаём вручную (оба входа сразу) — переопределяет
+            # автоматически собранный список из одного изображения. Основной
+            # параметр `image` формально обязателен в сигнатуре метода, поэтому
+            # тоже передаём его (дублирует первое изображение, безвредно).
+            result_image = client.image_to_image(
+                image=self.merge_image1_path.get(),
+                prompt=prompt,
+                model="black-forest-labs/FLUX.2-dev",
+                image_urls=[url1, url2],
+            )
 
-    def _run_manual_call_in_background(self, space_id, api_name, params):
-        try:
-            client = Client(space_id, token=self._get_manual_token())
-            wrapped_params = self._wrap_local_files(params)
+            output_dir = self.merge_output_dir.get() or OUTPUT_DIR
+            os.makedirs(output_dir, exist_ok=True)
+            name1 = os.path.splitext(os.path.basename(self.merge_image1_path.get()))[0]
+            name2 = os.path.splitext(os.path.basename(self.merge_image2_path.get()))[0]
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(output_dir, f"flux_{name1}_{name2}_{timestamp}.png")
+            result_image.save(out_path)
 
-            self.log(f"[Ручной эндпоинт] Вызываю {space_id} {api_name or ''} с параметрами: {params}")
-            kwargs = dict(wrapped_params)
-            if api_name:
-                kwargs["api_name"] = api_name
-            result = client.predict(**kwargs)
-
-            result_text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
-            self._set_readonly_text(self.manual_result_text, result_text)
-            self.manual_status_label.config(text="Готово", fg="green")
-            self.log("[Ручной эндпоинт] Вызов успешно завершён")
-
-            saved_path = self._save_first_output_file(result, space_id)
-            if saved_path:
-                self.log(f"[Ручной эндпоинт] Файл из результата сохранён: {saved_path}")
-                self.manual_status_label.config(
-                    text=f"Готово. Файл сохранён: {saved_path}", fg="green"
-                )
+            self.log(f"[Слияние] Готово (FLUX.2): {out_path}")
+            self._ui(lambda: self.merge_status_label.config(text=f"Готово: {out_path}", fg="green"))
+            self._ui(lambda: messagebox.showinfo("Готово", f"Результат сохранён:\n{out_path}"))
         except Exception as e:
-            self.log(f"[Ручной эндпоинт] ОШИБКА: {e}")
-            self.manual_status_label.config(text="Ошибка вызова", fg="red")
-            self._set_readonly_text(self.manual_result_text, f"Ошибка: {e}")
+            self.log(f"[Слияние] ОШИБКА (FLUX.2): {e}")
+            self._ui(lambda: self.merge_status_label.config(text="Ошибка", fg="red"))
+            self._ui(lambda: messagebox.showerror(
+                "Ошибка",
+                f"{e}\n\nЕсли ошибка про неизвестный параметр — пришли этот текст "
+                f"разработчику, чтобы поправить точные имена параметров провайдера."
+            ))
+        finally:
+            self._ui(lambda: self.merge_button.config(state="normal"))
 
-    def _save_first_output_file(self, result, space_id):
-        """Ищет в результате первый путь к существующему файлу и копирует его в output/."""
-        found = []
+    def _global_ctrl_key_handler(self, event):
+        """
+        Единый обработчик Ctrl+C/Ctrl+V/Ctrl+A/Ctrl+X для ВСЕХ текстовых полей
+        программы (Entry и Text/ScrolledText), по коду физической клавиши, а не
+        по символу — не зависит от раскладки клавиатуры (в отличие от встроенного
+        механизма Tkinter, который в русской раскладке для Ctrl+C/V/A попросту не
+        срабатывает, т.к. keysym для тех же физических клавиш другой).
 
-        def walk(value):
-            if isinstance(value, str) and os.path.isfile(value):
-                found.append(value)
-            elif isinstance(value, dict):
-                for v in value.values():
-                    walk(v)
-            elif isinstance(value, (list, tuple)):
-                for v in value:
-                    walk(v)
-
-        walk(result)
-        if not found:
+        Привязан на уровне всего приложения (bindtag 'all' — самый низкий
+        приоритет), поэтому не мешает более специфичным привязкам конкретных
+        виджетов (например, readonly-поля из _make_selectable_readonly уже сами
+        блокируют вставку на своём уровне, до того как событие сюда дойдёт).
+        """
+        if not (event.state & 0x4):  # Ctrl не зажат — не наше дело
             return None
 
-        src = found[0]
-        ext = os.path.splitext(src)[1] or ".bin"
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", space_id)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest_name = f"manual_{safe_name}_{timestamp}{ext}"
-        dest_path = os.path.join(OUTPUT_DIR, dest_name)
-        shutil.copy(src, dest_path)
-        return dest_path
+        widget = event.widget
+        is_text = isinstance(widget, tk.Text)
+        is_entry = isinstance(widget, (tk.Entry, ttk.Entry))
+        if not (is_text or is_entry):
+            return None  # не текстовое поле (кнопка, чекбокс и т.д.) — не трогаем
+
+        try:
+            state = str(widget.cget("state"))
+        except tk.TclError:
+            state = "normal"
+        is_locked = state in ("disabled", "readonly")
+
+        keycode = event.keycode
+
+        if keycode == 67:  # физическая клавиша 'C' — копировать
+            try:
+                selected = widget.get("sel.first", "sel.last") if is_text else widget.selection_get()
+                widget.clipboard_clear()
+                widget.clipboard_append(selected)
+            except tk.TclError:
+                pass  # нечего копировать — нет выделения
+            return "break"
+
+        if keycode == 86:  # 'V' — вставить
+            if is_locked:
+                return "break"  # поле только для чтения — вставка не нужна
+            try:
+                clip = widget.clipboard_get()
+            except tk.TclError:
+                return "break"  # в буфере ничего нет
+            try:
+                try:
+                    widget.delete("sel.first", "sel.last")  # заменить выделение, если есть
+                except tk.TclError:
+                    pass
+                widget.insert("insert", clip)
+            except tk.TclError:
+                pass
+            return "break"
+
+        if keycode == 65:  # 'A' — выделить всё
+            try:
+                if is_text:
+                    widget.tag_add("sel", "1.0", "end-1c")
+                else:
+                    widget.selection_range(0, tk.END)
+            except tk.TclError:
+                pass
+            return "break"
+
+        if keycode == 88:  # 'X' — вырезать
+            try:
+                selected = widget.get("sel.first", "sel.last") if is_text else widget.selection_get()
+                widget.clipboard_clear()
+                widget.clipboard_append(selected)
+                if not is_locked:
+                    widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            return "break"
+
+        return None
 
     def _make_selectable_readonly(self, widget):
         """
@@ -1191,7 +1288,10 @@ class App(tk.Tk):
 
 def process_video(source_path: str, background_path: str, bg_kind: str = "video",
                    fast_mode: bool = True, no_timeout: bool = False,
-                   log_callback=print) -> str:
+                   output_dir: str = None, log_callback=print) -> str:
+    output_dir = output_dir or OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
     client = Client(
         "innova-ai/video-background-removal",
         token=TOKEN,
@@ -1254,21 +1354,25 @@ def process_video(source_path: str, background_path: str, bg_kind: str = "video"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     final_name = f"{source_name}_{bg_name}_{timestamp}.mp4"
-    final_path = os.path.join(OUTPUT_DIR, final_name)
+    final_path = os.path.join(output_dir, final_name)
     shutil.copy(final_output_video["video"], final_path)
     return final_path
 
 
 def convert_video(source_path: str, output_format: str, video_codec: str,
                    scale: str = None, crf: int = 23, audio_codec: str = "aac",
-                   log_callback=print) -> str:
+                   output_dir: str = None, log_callback=print) -> str:
     """
     Конвертирует видео через ffmpeg: формат, кодек, разрешение, аудиокодек.
 
     scale: строка вида "1920:1080" или None (оставить оригинальное разрешение).
     crf: 0-51, меньше = выше качество и больше размер файла (не используется для 'copy').
     audio_codec: "aac" / "copy" / "libmp3lame" / "none" (без звука).
+    output_dir: куда сохранить результат (по умолчанию — стандартная папка output/).
     """
+    output_dir = output_dir or OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
     if not FFMPEG_PATH:
         raise RuntimeError(
             "ffmpeg не найден в PATH. Установи ffmpeg (ffmpeg.org/download.html) "
@@ -1288,7 +1392,7 @@ def convert_video(source_path: str, output_format: str, video_codec: str,
     source_name = os.path.splitext(os.path.basename(source_path))[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_name = f"{source_name}_conv_{timestamp}.{output_format}"
-    output_path = os.path.join(OUTPUT_DIR, output_name)
+    output_path = os.path.join(output_dir, output_name)
 
     cmd = [FFMPEG_PATH, "-y", "-i", source_path]
 
