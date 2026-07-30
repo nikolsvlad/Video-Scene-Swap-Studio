@@ -86,6 +86,16 @@ VIDEO_MIME_TYPES = {
     ".mkv": "video/x-matroska",
 }
 
+# Gemini ограничивает inline-данные (видео прямо в теле JSON-запроса, в base64)
+# суммарно примерно 20 МБ на запрос. Для файлов больше этого порога нужно
+# загружать видео через отдельный File API (потоково, без сборки всей base64
+# строки в памяти разом) — иначе на больших видео (сотни МБ) программа может
+# упереться в лимит API или ощутимо разово раздуть потребление памяти.
+INLINE_SIZE_LIMIT_BYTES = 15 * 1024 * 1024  # 15 МБ — с запасом от лимита в 20 МБ
+
+FILES_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+FILES_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
 
 def _video_to_base64(path: str) -> str:
     with open(path, "rb") as f:
@@ -97,37 +107,209 @@ def _mime_type_for(video_path: str) -> str:
     return VIDEO_MIME_TYPES.get(ext, "video/mp4")
 
 
+def _upload_video_via_file_api(video_path: str, mime_type: str, log_callback=print) -> str:
+    """
+    Загружает видео через File API Gemini (для файлов больше INLINE_SIZE_LIMIT_BYTES).
+    Возвращает file_uri, который потом подставляется в запрос вместо inline_data —
+    так видео не нужно целиком кодировать в base64 и держать в памяти процесса.
+
+    Протокол — "resumable upload" Google (см. документацию Gemini File API):
+      1) стартовый запрос с метаданными файла, в ответ приходит upload-URL;
+      2) собственно загрузка байтов на этот upload-URL;
+      3) опрос статуса файла (PROCESSING -> ACTIVE) перед использованием.
+    """
+    file_size = os.path.getsize(video_path)
+    display_name = os.path.basename(video_path)
+
+    start_headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(file_size),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json",
+    }
+    start_response = requests.post(
+        FILES_UPLOAD_URL,
+        headers=start_headers,
+        json={"file": {"display_name": display_name}},
+        timeout=60,
+    )
+    start_response.raise_for_status()
+    upload_url = start_response.headers.get("X-Goog-Upload-URL") or start_response.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise IndexerError("File API не вернул upload-URL — не удалось начать загрузку видео")
+
+    # Загружаем файл ПОТОКОВО (по частям с диска), не читая его целиком в
+    # одну большую переменную в памяти — как раз то, чего не хватало в
+    # оригинальной inline-схеме с base64.
+    with open(video_path, "rb") as f:
+        upload_headers = {
+            "Content-Length": str(file_size),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        }
+        upload_response = requests.post(upload_url, headers=upload_headers, data=f, timeout=300)
+    upload_response.raise_for_status()
+    file_info = upload_response.json().get("file", {})
+
+    file_name = file_info.get("name")
+    file_uri = file_info.get("uri")
+    state = file_info.get("state", "")
+
+    # Google обрабатывает видео асинхронно — ждём, пока файл станет ACTIVE
+    wait_seconds = 0
+    while state == "PROCESSING" and wait_seconds < 120:
+        time.sleep(3)
+        wait_seconds += 3
+        status_response = requests.get(
+            f"{FILES_BASE_URL}/{file_name}",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=30,
+        )
+        status_response.raise_for_status()
+        file_info = status_response.json()
+        state = file_info.get("state", "")
+        log_callback(f"Обработка загруженного файла на стороне Gemini... ({state})")
+
+    if state != "ACTIVE":
+        raise IndexerError(f"Файл не перешёл в состояние ACTIVE (текущее: {state or 'неизвестно'})")
+
+    return file_uri
+
+
+def _delete_uploaded_file(file_uri: str, log_callback=print):
+    """Удаляет файл с серверов Gemini после использования (не обязательно —
+    файлы и так истекают через 48 часов — но так аккуратнее)."""
+    try:
+        file_name = "files/" + file_uri.rstrip("/").split("/")[-1]
+        requests.delete(
+            f"{FILES_BASE_URL}/{file_name}",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=30,
+        )
+    except Exception as e:
+        log_callback(f"Не удалось удалить временный файл с серверов Gemini (не критично): {e}")
+
+
 def _describe_video(video_path: str, log_callback=print) -> str:
-    """Просит Gemini коротко описать видео: сцена, объекты, настроение, теги."""
+    """
+    Просит Gemini описать видео СТРУКТУРИРОВАННО (JSON с фиксированными полями),
+    а не свободным абзацем. Причина: при свободной прозе модель каждый раз
+    по-разному решает, какие факты включать (например, называть ли персонажа
+    по имени или писать обезличенно "мужчина") — из-за этого два вызова на
+    ОДИНАКОВЫЙ контент (например, один и тот же клип в .mp4 и .webm) дают
+    заметно разные эмбеддинги и разный score при поиске. Жёсткий шаблон полей
+    убирает эту непоследовательность: субъект/персонаж — всегда отдельное
+    обязательное поле, а не то, что модель может случайно опустить в потоке.
+    Финальный текст для эмбеддинга собирается из полей по фиксированному
+    шаблону, а не берётся напрямую из "художественного" текста модели.
+    """
     if not GEMINI_API_KEY:
         raise IndexerError("GEMINI_API_KEY не задан в .env")
 
-    video_b64 = _video_to_base64(video_path)
+    mime_type = _mime_type_for(video_path)
+    file_size = os.path.getsize(video_path)
+    uploaded_file_uri = None
+
+    if file_size > INLINE_SIZE_LIMIT_BYTES:
+        # Большой файл — грузим через File API, а не пытаемся закодировать
+        # в base64 и держать в памяти целиком (риск OOM + лимит inline ~20 МБ).
+        log_callback(
+            f"Файл больше {INLINE_SIZE_LIMIT_BYTES // (1024*1024)} МБ "
+            f"({file_size // (1024*1024)} МБ) — загружаю через File API..."
+        )
+        uploaded_file_uri = _upload_video_via_file_api(video_path, mime_type, log_callback=log_callback)
+        video_part = {"file_data": {"mime_type": mime_type, "file_uri": uploaded_file_uri}}
+    else:
+        video_part = {"inline_data": {"mime_type": mime_type, "data": _video_to_base64(video_path)}}
 
     prompt = (
-        "Опиши это видео одним абзацем для поиска по банку футажей: что происходит, "
-        "какая обстановка/сцена, какие объекты и люди видны, какое настроение/тон "
-        "(например: юмористический, тревожный, спокойный). Если это мем — опиши, "
-        "в чём его суть, и в каких ситуациях его уместно использовать. "
-        "ВАЖНО: описывай только то, что видно и слышно уверенно. Если не можешь "
-        "точно определить язык речи/песни, точные слова или другие неочевидные детали — "
-        "не угадывай и не указывай их вообще, лучше опусти эту деталь. "
-        "Не используй markdown, только обычный текст, 2-4 предложения."
+        "Проанализируй это видео для индексации в банке футажей и верни СТРОГО JSON "
+        "без пояснений вне JSON, без markdown-разметки, в следующем формате:\n"
+        '{"subject": "кто/что в кадре — если это узнаваемый человек (публичная '
+        'личность), назови его по имени, иначе опиши коротко (например \'мужчина '
+        'в очках\')", '
+        '"scene": "обстановка/фон/локация одним предложением", '
+        '"mood": "настроение/тон одним-двумя словами, например: юмористический, '
+        'тревожный, спокойный", '
+        '"summary": "1-2 предложения: что происходит и в чём суть, если это мем", '
+        '"tags": ["3-6 коротких ключевых слов для поиска — приоритет отдавай '
+        'КОНКРЕТНЫМ, различающим деталям (объекты, локация, цвета, действия), '
+        'а не общим жанровым словам вроде \'мем\'/\'юмор\'/\'видео\', которые '
+        'подходят почти любому ролику в этой же папке"]}\n\n'
+        "ВАЖНО: указывай только то, что видно/слышно уверенно. Если не можешь точно "
+        "определить язык речи, точные слова или другие неочевидные детали — не "
+        "угадывай, просто не включай эту деталь ни в одно поле. Если персонаж — "
+        "узнаваемая публичная личность, обязательно назови его в поле subject "
+        "одинаково при каждом описании (полное имя), не заменяй на общие слова."
     )
 
     payload = {
         "contents": [{
             "parts": [
-                {"inline_data": {"mime_type": _mime_type_for(video_path), "data": video_b64}},
+                video_part,
                 {"text": prompt},
             ]
         }],
-        "generationConfig": {"temperature": 0},
+        "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
 
-    response = _post_with_retry(GENERATE_URL, payload, timeout=120, log_callback=log_callback)
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    try:
+        response = _post_with_retry(GENERATE_URL, payload, timeout=120, log_callback=log_callback)
+        data = response.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if not match:
+            # Модель не вернула JSON — fallback: используем как есть, без структурирования.
+            log_callback("Модель не вернула JSON, использую текст как есть (может снизить консистентность)")
+            return raw_text
+
+        try:
+            fields = json.loads(match.group())
+        except json.JSONDecodeError:
+            log_callback("Не удалось распарсить JSON от модели, использую текст как есть")
+            return raw_text
+
+        subject = (fields.get("subject") or "").strip()
+        scene = (fields.get("scene") or "").strip()
+        mood = (fields.get("mood") or "").strip()
+        summary = (fields.get("summary") or "").strip()
+        tags = fields.get("tags") or []
+        tags_sorted = sorted(t.strip() for t in tags if isinstance(t, str) and t.strip())
+
+        # Собираем описание по ФИКСИРОВАННОМУ шаблону. Сцена и теги — самая
+        # РАЗЛИЧАЮЩАЯ информация для поиска футажей (в отличие от subject/mood,
+        # которые часто повторяются у десятков видео из одной папки — например,
+        # у всех клипов один и тот же персонаж/жанр). Если просто склеить все поля
+        # подряд, общие для всей папки слова "перевешивают" в итоговом эмбеддинге
+        # уникальную деталь сцены, и поиск по конкретному признаку (например,
+        # "океан") работает хуже, чем должен. Поэтому сцена и теги вынесены в
+        # начало текста и продублированы — это увеличивает их вес в векторе.
+        parts = []
+        if scene:
+            parts.append(f"Ключевая сцена: {scene}.")
+        if tags_sorted:
+            parts.append(f"Ключевые слова: {', '.join(tags_sorted)}.")
+        if subject:
+            parts.append(f"Объект/персонаж: {subject}.")
+        if scene:
+            parts.append(f"Сцена: {scene}.")
+        if mood:
+            parts.append(f"Настроение: {mood}.")
+        if summary:
+            parts.append(f"Суть: {summary}")
+        if tags_sorted:
+            parts.append(f"Теги: {', '.join(tags_sorted)}.")
+
+        description = " ".join(parts).strip()
+        return description or raw_text
+    finally:
+        # Если загружали через File API — подчищаем за собой на серверах Gemini.
+        # Файлы там и так истекают сами через 48 часов, но лучше не копить мусор.
+        if uploaded_file_uri:
+            _delete_uploaded_file(uploaded_file_uri, log_callback=log_callback)
 
 
 def _embed_text(text: str, log_callback=print) -> list:
